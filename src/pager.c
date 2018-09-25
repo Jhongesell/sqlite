@@ -700,6 +700,7 @@ struct Pager {
   int (*xBusyHandler)(void*); /* Function to call when busy */
   void *pBusyHandlerArg;      /* Context argument for xBusyHandler */
   int aStat[4];               /* Total cache hits, misses, writes, spills */
+  LockEventHandlers* pLockEventHandlers; /* For external lock synchronization */
 #ifdef SQLITE_TEST
   int nRead;                  /* Database pages read */
 #endif
@@ -1148,7 +1149,16 @@ static int pagerUnlockDb(Pager *pPager, int eLock){
   assert( eLock!=NO_LOCK || pagerUseWal(pPager)==0 );
   if( isOpen(pPager->fd) ){
     assert( pPager->eLock>=eLock );
-    rc = pPager->noLock ? SQLITE_OK : sqlite3OsUnlock(pPager->fd, eLock);
+
+    //rc = pPager->noLock ? SQLITE_OK : sqlite3OsUnlock(pPager->fd, eLock);
+
+    if (pPager->noLock) {
+      rc = SQLITE_OK;
+    } else {
+      rc = sqlite3OsUnlock(pPager->fd, eLock);
+      sqlite3InvokeUnlockEvent(pPager->pLockEventHandlers, eLock);
+    }
+    
     if( pPager->eLock!=UNKNOWN_LOCK ){
       pPager->eLock = (u8)eLock;
     }
@@ -1172,10 +1182,26 @@ static int pagerLockDb(Pager *pPager, int eLock){
 
   assert( eLock==SHARED_LOCK || eLock==RESERVED_LOCK || eLock==EXCLUSIVE_LOCK );
   if( pPager->eLock<eLock || pPager->eLock==UNKNOWN_LOCK ){
-    rc = pPager->noLock ? SQLITE_OK : sqlite3OsLock(pPager->fd, eLock);
+
+      /* rc = pPager->noLock ? SQLITE_OK : sqlite3OsLock(pPager->fd, eLock); */
+
+      if (pPager->noLock) {
+          rc = SQLITE_OK;
+      } else {
+        /* Get application lock, if applicable */
+        rc = sqlite3InvokeLockEvent(pPager->pLockEventHandlers, eLock);
+
+        if (rc == SQLITE_BUSY) { return rc; }
+          
+        rc = sqlite3OsLock(pPager->fd, eLock);          
+      }
+      
     if( rc==SQLITE_OK && (pPager->eLock!=UNKNOWN_LOCK||eLock==EXCLUSIVE_LOCK) ){
       pPager->eLock = (u8)eLock;
       IOTRACE(("LOCK %p %d\n", pPager, eLock))
+    } else {
+      /* Set thread lock back to original state */
+      sqlite3InvokeUnlockEvent(pPager->pLockEventHandlers, pPager->eLock);
     }
   }
   return rc;
@@ -3510,6 +3536,10 @@ static int pagerPlaybackSavepoint(Pager *pPager, PagerSavepoint *pSavepoint){
 */
 void sqlite3PagerSetCachesize(Pager *pPager, int mxPage){
   sqlite3PcacheSetCachesize(pPager->pPCache, mxPage);
+}
+
+void sqlite3PagerSetLockEventHandlers(Pager* pPager, LockEventHandlers *pHandlers){
+  pPager->pLockEventHandlers = pHandlers;
 }
 
 /*

@@ -2704,6 +2704,15 @@ int sqlite3BtreeSetCacheSize(Btree *p, int mxPage){
   return SQLITE_OK;
 }
 
+int sqlite3BtreeThreadLockHandlers(Btree* p, LockEventHandlers* pHandlers)
+{
+  BtShared *pBt = p->pBt;
+  pBt->pLockEventHandlers = pHandlers;
+  sqlite3PagerSetLockEventHandlers(pBt->pPager, pHandlers);
+
+  return SQLITE_OK;
+}
+
 /*
 ** Change the "spill" limit on the number of pages in the cache.
 ** If the number of pages exceeds this limit during a write transaction,
