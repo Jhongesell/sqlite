@@ -37,18 +37,6 @@
 #endif
 
 /*
-** Given a cursor number and a column for a table or index, compute a
-** hash value for use in the Mem.iTabColHash value.  The iTabColHash
-** column is only used for verification - it is omitted from production
-** builds.  Collisions are harmless in the sense that the correct answer
-** still results.  The only harm of collisions is that they can potential
-** reduce column-cache error detection during SQLITE_DEBUG builds.
-**
-** No valid hash should be 0.
-*/
-#define TableColumnHash(T,C)  (((u32)(T)<<16)^(u32)(C+2))
-
-/*
 ** The following global variable is incremented every time a cursor
 ** moves, either by the OP_SeekXX, OP_Next, or OP_Prev opcodes.  The test
 ** procedures use this information to make sure that indices are
@@ -134,32 +122,56 @@ int sqlite3_found_count = 0;
 ** feature is used for test suite validation only and does not appear an
 ** production builds.
 **
-** M is an integer, 2 or 3, that indices how many different ways the
-** branch can go.  It is usually 2.  "I" is the direction the branch
-** goes.  0 means falls through.  1 means branch is taken.  2 means the
-** second alternative branch is taken.
+** M is an integer between 2 and 4.  2 indicates a ordinary two-way
+** branch (I=0 means fall through and I=1 means taken).  3 indicates
+** a 3-way branch where the third way is when one of the operands is
+** NULL.  4 indicates the OP_Jump instruction which has three destinations
+** depending on whether the first operand is less than, equal to, or greater
+** than the second. 
 **
 ** iSrcLine is the source code line (from the __LINE__ macro) that
-** generated the VDBE instruction.  This instrumentation assumes that all
-** source code is in a single file (the amalgamation).  Special values 1
-** and 2 for the iSrcLine parameter mean that this particular branch is
-** always taken or never taken, respectively.
+** generated the VDBE instruction combined with flag bits.  The source
+** code line number is in the lower 24 bits of iSrcLine and the upper
+** 8 bytes are flags.  The lower three bits of the flags indicate
+** values for I that should never occur.  For example, if the branch is
+** always taken, the flags should be 0x05 since the fall-through and
+** alternate branch are never taken.  If a branch is never taken then
+** flags should be 0x06 since only the fall-through approach is allowed.
+**
+** Bit 0x04 of the flags indicates an OP_Jump opcode that is only
+** interested in equal or not-equal.  In other words, I==0 and I==2
+** should be treated the same.
+**
+** Since only a line number is retained, not the filename, this macro
+** only works for amalgamation builds.  But that is ok, since these macros
+** should be no-ops except for special builds used to measure test coverage.
 */
 #if !defined(SQLITE_VDBE_COVERAGE)
 # define VdbeBranchTaken(I,M)
 #else
 # define VdbeBranchTaken(I,M) vdbeTakeBranch(pOp->iSrcLine,I,M)
-  static void vdbeTakeBranch(int iSrcLine, u8 I, u8 M){
-    if( iSrcLine<=2 && ALWAYS(iSrcLine>0) ){
-      M = iSrcLine;
-      /* Assert the truth of VdbeCoverageAlwaysTaken() and 
-      ** VdbeCoverageNeverTaken() */
-      assert( (M & I)==I );
-    }else{
-      if( sqlite3GlobalConfig.xVdbeBranch==0 ) return;  /*NO_TEST*/
-      sqlite3GlobalConfig.xVdbeBranch(sqlite3GlobalConfig.pVdbeBranchArg,
-                                      iSrcLine,I,M);
+  static void vdbeTakeBranch(u32 iSrcLine, u8 I, u8 M){
+    u8 mNever;
+    assert( I<=2 );  /* 0: fall through,  1: taken,  2: alternate taken */
+    assert( M<=4 );  /* 2: two-way branch, 3: three-way branch, 4: OP_Jump */
+    assert( I<M );   /* I can only be 2 if M is 3 or 4 */
+    /* Transform I from a integer [0,1,2] into a bitmask of [1,2,4] */
+    I = 1<<I;
+    /* The upper 8 bits of iSrcLine are flags.  The lower three bits of
+    ** the flags indicate directions that the branch can never go.  If
+    ** a branch really does go in one of those directions, assert right
+    ** away. */
+    mNever = iSrcLine >> 24;
+    assert( (I & mNever)==0 );
+    if( sqlite3GlobalConfig.xVdbeBranch==0 ) return;  /*NO_TEST*/
+    I |= mNever;
+    if( M==2 ) I |= 0x04;
+    if( M==4 ){
+      I |= 0x08;
+      if( (mNever&0x08)!=0 && (I&0x05)!=0) I |= 0x05; /*NO_TEST*/
     }
+    sqlite3GlobalConfig.xVdbeBranch(sqlite3GlobalConfig.pVdbeBranchArg,
+                                    iSrcLine&0xffffff, I, M);
   }
 #endif
 
@@ -490,7 +502,7 @@ static void memTracePrint(Mem *p){
   }else if( p->flags & MEM_Real ){
     printf(" r:%g", p->u.r);
 #endif
-  }else if( p->flags & MEM_RowSet ){
+  }else if( sqlite3VdbeMemIsRowSet(p) ){
     printf(" (rowset)");
   }else{
     char zBuf[200];
@@ -1155,6 +1167,9 @@ case OP_Null: {           /* out2 */
   assert( pOp->p3<=(p->nMem+1 - p->nCursor) );
   pOut->flags = nullFlag = pOp->p1 ? (MEM_Null|MEM_Cleared) : MEM_Null;
   pOut->n = 0;
+#ifdef SQLITE_DEBUG
+  pOut->uTemp = 0;
+#endif
   while( cnt>0 ){
     pOut++;
     memAboutToChange(p, pOut);
@@ -1281,7 +1296,6 @@ case OP_Copy: {
     Deephemeralize(pOut);
 #ifdef SQLITE_DEBUG
     pOut->pScopyFrom = 0;
-    pOut->iTabColHash = 0;
 #endif
     REGISTER_TRACE(pOp->p2+pOp->p3-n, pOut);
     if( (n--)==0 ) break;
@@ -1945,7 +1959,12 @@ case OP_Ge: {             /* same as TK_GE, jump, in1, in3 */
       if( (flags1 | flags3)&MEM_Str ){
         if( (flags1 & (MEM_Int|MEM_Real|MEM_Str))==MEM_Str ){
           applyNumericAffinity(pIn1,0);
-          testcase( flags3!=pIn3->flags ); /* Possible if pIn1==pIn3 */
+          assert( flags3==pIn3->flags );
+          /* testcase( flags3!=pIn3->flags );
+          ** this used to be possible with pIn1==pIn3, but not since
+          ** the column cache was removed.  The following assignment
+          ** is essentially a no-op.  But, it provides defense-in-depth
+          ** in case our analysis is incorrect, so it is left in. */
           flags3 = pIn3->flags;
         }
         if( (flags3 & (MEM_Int|MEM_Real|MEM_Str))==MEM_Str ){
@@ -2159,11 +2178,11 @@ case OP_Compare: {
 */
 case OP_Jump: {             /* jump */
   if( iCompare<0 ){
-    VdbeBranchTaken(0,3); pOp = &aOp[pOp->p1 - 1];
+    VdbeBranchTaken(0,4); pOp = &aOp[pOp->p1 - 1];
   }else if( iCompare==0 ){
-    VdbeBranchTaken(1,3); pOp = &aOp[pOp->p2 - 1];
+    VdbeBranchTaken(1,4); pOp = &aOp[pOp->p2 - 1];
   }else{
-    VdbeBranchTaken(2,3); pOp = &aOp[pOp->p3 - 1];
+    VdbeBranchTaken(2,4); pOp = &aOp[pOp->p3 - 1];
   }
   break;
 }
@@ -2875,17 +2894,25 @@ case OP_MakeRecord: {
     if( nVarint<sqlite3VarintLen(nHdr) ) nHdr++;
   }
   nByte = nHdr+nData;
-  if( nByte+nZero>db->aLimit[SQLITE_LIMIT_LENGTH] ){
-    goto too_big;
-  }
 
   /* Make sure the output register has a buffer large enough to store 
   ** the new record. The output register (pOp->p3) is not allowed to
   ** be one of the input registers (because the following call to
   ** sqlite3VdbeMemClearAndResize() could clobber the value before it is used).
   */
-  if( sqlite3VdbeMemClearAndResize(pOut, (int)nByte) ){
-    goto no_mem;
+  if( nByte+nZero<=pOut->szMalloc ){
+    /* The output register is already large enough to hold the record.
+    ** No error checks or buffer enlargement is required */
+    pOut->z = pOut->zMalloc;
+  }else{
+    /* Need to make sure that the output is not too big and then enlarge
+    ** the output register to hold the full result */
+    if( nByte+nZero>db->aLimit[SQLITE_LIMIT_LENGTH] ){
+      goto too_big;
+    }
+    if( sqlite3VdbeMemClearAndResize(pOut, (int)nByte) ){
+      goto no_mem;
+    }
   }
   zNewRecord = (u8 *)pOut->z;
 
@@ -3075,7 +3102,7 @@ case OP_Savepoint: {
           }
         }
         if( isSchemaChange ){
-          sqlite3ExpirePreparedStatements(db);
+          sqlite3ExpirePreparedStatements(db, 0);
           sqlite3ResetAllSchemasOfConnection(db);
           db->mDbFlags |= DBFLAG_SchemaChange;
         }
@@ -3364,7 +3391,7 @@ case OP_SetCookie: {
   if( pOp->p1==1 ){
     /* Invalidate all prepared statements whenever the TEMP database
     ** schema is changed.  Ticket #1644 */
-    sqlite3ExpirePreparedStatements(db);
+    sqlite3ExpirePreparedStatements(db, 0);
     p->expired = 0;
   }
   if( rc ) goto abort_due_to_error;
@@ -3482,7 +3509,7 @@ case OP_OpenWrite:
   assert( pOp->opcode==OP_OpenRead || pOp->opcode==OP_ReopenIdx
           || p->readOnly==0 );
 
-  if( p->expired ){
+  if( p->expired==1 ){
     rc = SQLITE_ABORT_ROLLBACK;
     goto abort_due_to_error;
   }
@@ -3865,10 +3892,10 @@ case OP_ColumnsUsed: {
 **
 ** See also: Found, NotFound, SeekGt, SeekGe, SeekLt
 */
-case OP_SeekLT:         /* jump, in3 */
-case OP_SeekLE:         /* jump, in3 */
-case OP_SeekGE:         /* jump, in3 */
-case OP_SeekGT: {       /* jump, in3 */
+case OP_SeekLT:         /* jump, in3, group */
+case OP_SeekLE:         /* jump, in3, group */
+case OP_SeekGE:         /* jump, in3, group */
+case OP_SeekGT: {       /* jump, in3, group */
   int res;           /* Comparison result */
   int oc;            /* Opcode */
   VdbeCursor *pC;    /* The cursor to seek */
@@ -4296,13 +4323,21 @@ case OP_SeekRowid: {        /* jump, in3 */
 
   pIn3 = &aMem[pOp->p3];
   if( (pIn3->flags & MEM_Int)==0 ){
+    /* Make sure pIn3->u.i contains a valid integer representation of
+    ** the key value, but do not change the datatype of the register, as
+    ** other parts of the perpared statement might be depending on the
+    ** current datatype. */
+    u16 origFlags = pIn3->flags;
+    int isNotInt;
     applyAffinity(pIn3, SQLITE_AFF_NUMERIC, encoding);
-    if( (pIn3->flags & MEM_Int)==0 ) goto jump_to_p2;
+    isNotInt = (pIn3->flags & MEM_Int)==0;
+    pIn3->flags = origFlags;
+    if( isNotInt ) goto jump_to_p2;
   }
   /* Fall through into OP_NotExists */
 case OP_NotExists:          /* jump, in3 */
   pIn3 = &aMem[pOp->p3];
-  assert( pIn3->flags & MEM_Int );
+  assert( (pIn3->flags & MEM_Int)!=0 || pOp->opcode==OP_SeekRowid );
   assert( pOp->p1>=0 && pOp->p1<p->nCursor );
   pC = p->apCsr[pOp->p1];
   assert( pC!=0 );
@@ -5082,13 +5117,17 @@ case OP_Sort: {        /* jump */
   p->aCounter[SQLITE_STMTSTATUS_SORT]++;
   /* Fall through into OP_Rewind */
 }
-/* Opcode: Rewind P1 P2 * * *
+/* Opcode: Rewind P1 P2 * * P5
 **
 ** The next use of the Rowid or Column or Next instruction for P1 
 ** will refer to the first entry in the database table or index.
 ** If the table or index is empty, jump immediately to P2.
 ** If the table or index is not empty, fall through to the following 
 ** instruction.
+**
+** If P5 is non-zero and the table is not empty, then the "skip-next"
+** flag is set on the cursor so that the next OP_Next instruction 
+** executed on it is a no-op.
 **
 ** This opcode leaves the cursor configured to move in forward order,
 ** from the beginning toward the end.  In other words, the cursor is
@@ -5114,6 +5153,9 @@ case OP_Rewind: {        /* jump */
     pCrsr = pC->uc.pCursor;
     assert( pCrsr );
     rc = sqlite3BtreeFirst(pCrsr, &res);
+#ifndef SQLITE_OMIT_WINDOWFUNC
+    if( pOp->p5 ) sqlite3BtreeSkipNext(pCrsr);
+#endif
     pC->deferredMoveto = 0;
     pC->cacheStatus = CACHE_STALE;
   }
@@ -5495,7 +5537,13 @@ case OP_IdxGE:  {       /* jump */
   }
   r.aMem = &aMem[pOp->p3];
 #ifdef SQLITE_DEBUG
-  { int i; for(i=0; i<r.nField; i++) assert( memIsValid(&r.aMem[i]) ); }
+  {
+    int i;
+    for(i=0; i<r.nField; i++){
+      assert( memIsValid(&r.aMem[i]) );
+      REGISTER_TRACE(pOp->p3+i, &aMem[pOp->p3+i]);
+    }
+  }
 #endif
   res = 0;  /* Not needed.  Only used to silence a warning. */
   rc = sqlite3VdbeIdxKeyCompare(db, pC, &r, &res);
@@ -5682,7 +5730,8 @@ case OP_SqlExec: {
 /* Opcode: ParseSchema P1 * * P4 *
 **
 ** Read and parse all entries from the SQLITE_MASTER table of database P1
-** that match the WHERE clause P4. 
+** that match the WHERE clause P4.  If P4 is a NULL pointer, then the
+** entire schema for P1 is reparsed.
 **
 ** This opcode invokes the parser to create a new virtual machine,
 ** then runs the new virtual machine.  It is thus a re-entrant opcode.
@@ -5706,11 +5755,22 @@ case OP_ParseSchema: {
   iDb = pOp->p1;
   assert( iDb>=0 && iDb<db->nDb );
   assert( DbHasProperty(db, iDb, DB_SchemaLoaded) );
-  /* Used to be a conditional */ {
+
+#ifndef SQLITE_OMIT_ALTERTABLE
+  if( pOp->p4.z==0 ){
+    sqlite3SchemaClear(db->aDb[iDb].pSchema);
+    db->mDbFlags &= ~DBFLAG_SchemaKnownOk;
+    rc = sqlite3InitOne(db, iDb, &p->zErrMsg, INITFLAG_AlterTable);
+    db->mDbFlags |= DBFLAG_SchemaChange;
+    p->expired = 0;
+  }else
+#endif
+  {
     zMaster = MASTER_NAME;
     initData.db = db;
     initData.iDb = pOp->p1;
     initData.pzErrMsg = &p->zErrMsg;
+    initData.mInitFlags = 0;
     zSql = sqlite3MPrintf(db,
        "SELECT name, rootpage, sql FROM '%q'.%s WHERE %s ORDER BY rowid",
        db->aDb[iDb].zDbSName, zMaster, pOp->p4.z);
@@ -5863,11 +5923,11 @@ case OP_RowSetAdd: {       /* in1, in2 */
   pIn1 = &aMem[pOp->p1];
   pIn2 = &aMem[pOp->p2];
   assert( (pIn2->flags & MEM_Int)!=0 );
-  if( (pIn1->flags & MEM_RowSet)==0 ){
-    sqlite3VdbeMemSetRowSet(pIn1);
-    if( (pIn1->flags & MEM_RowSet)==0 ) goto no_mem;
+  if( (pIn1->flags & MEM_Blob)==0 ){
+    if( sqlite3VdbeMemSetRowSet(pIn1) ) goto no_mem;
   }
-  sqlite3RowSetInsert(pIn1->u.pRowSet, pIn2->u.i);
+  assert( sqlite3VdbeMemIsRowSet(pIn1) );
+  sqlite3RowSetInsert((RowSet*)pIn1->z, pIn2->u.i);
   break;
 }
 
@@ -5883,8 +5943,9 @@ case OP_RowSetRead: {       /* jump, in1, out3 */
   i64 val;
 
   pIn1 = &aMem[pOp->p1];
-  if( (pIn1->flags & MEM_RowSet)==0 
-   || sqlite3RowSetNext(pIn1->u.pRowSet, &val)==0
+  assert( (pIn1->flags & MEM_Blob)==0 || sqlite3VdbeMemIsRowSet(pIn1) );
+  if( (pIn1->flags & MEM_Blob)==0 
+   || sqlite3RowSetNext((RowSet*)pIn1->z, &val)==0
   ){
     /* The boolean index is empty */
     sqlite3VdbeMemSetNull(pIn1);
@@ -5933,20 +5994,19 @@ case OP_RowSetTest: {                     /* jump, in1, in3 */
   /* If there is anything other than a rowset object in memory cell P1,
   ** delete it now and initialize P1 with an empty rowset
   */
-  if( (pIn1->flags & MEM_RowSet)==0 ){
-    sqlite3VdbeMemSetRowSet(pIn1);
-    if( (pIn1->flags & MEM_RowSet)==0 ) goto no_mem;
+  if( (pIn1->flags & MEM_Blob)==0 ){
+    if( sqlite3VdbeMemSetRowSet(pIn1) ) goto no_mem;
   }
-
+  assert( sqlite3VdbeMemIsRowSet(pIn1) );
   assert( pOp->p4type==P4_INT32 );
   assert( iSet==-1 || iSet>=0 );
   if( iSet ){
-    exists = sqlite3RowSetTest(pIn1->u.pRowSet, iSet, pIn3->u.i);
+    exists = sqlite3RowSetTest((RowSet*)pIn1->z, iSet, pIn3->u.i);
     VdbeBranchTaken(exists!=0,2);
     if( exists ) goto jump_to_p2;
   }
   if( iSet>=0 ){
-    sqlite3RowSetInsert(pIn1->u.pRowSet, pIn3->u.i);
+    sqlite3RowSetInsert((RowSet*)pIn1->z, pIn3->u.i);
   }
   break;
 }
@@ -6010,7 +6070,7 @@ case OP_Program: {        /* jump */
   ** of the current program, and the memory required at runtime to execute
   ** the trigger program. If this trigger has been fired before, then pRt 
   ** is already allocated. Otherwise, it must be initialized.  */
-  if( (pRt->flags&MEM_Frame)==0 ){
+  if( (pRt->flags&MEM_Blob)==0 ){
     /* SubProgram.nMem is set to the number of memory cells used by the 
     ** program stored in SubProgram.aOp. As well as these, one memory
     ** cell is required for each cursor used by the program. Set local
@@ -6028,8 +6088,10 @@ case OP_Program: {        /* jump */
       goto no_mem;
     }
     sqlite3VdbeMemRelease(pRt);
-    pRt->flags = MEM_Frame;
-    pRt->u.pFrame = pFrame;
+    pRt->flags = MEM_Blob|MEM_Dyn;
+    pRt->z = (char*)pFrame;
+    pRt->n = nByte;
+    pRt->xDel = sqlite3VdbeFrameMemDel;
 
     pFrame->v = p;
     pFrame->nChildMem = nMem;
@@ -6045,6 +6107,9 @@ case OP_Program: {        /* jump */
 #ifdef SQLITE_ENABLE_STMT_SCANSTATUS
     pFrame->anExec = p->anExec;
 #endif
+#ifdef SQLITE_DEBUG
+    pFrame->iFrameMagic = SQLITE_FRAME_MAGIC;
+#endif
 
     pEnd = &VdbeFrameMem(pFrame)[pFrame->nChildMem];
     for(pMem=VdbeFrameMem(pFrame); pMem!=pEnd; pMem++){
@@ -6052,7 +6117,8 @@ case OP_Program: {        /* jump */
       pMem->db = db;
     }
   }else{
-    pFrame = pRt->u.pFrame;
+    pFrame = (VdbeFrame*)pRt->z;
+    assert( pRt->xDel==sqlite3VdbeFrameMemDel );
     assert( pProgram->nMem+pProgram->nCsr==pFrame->nChildMem 
         || (pProgram->nCsr==0 && pProgram->nMem+1==pFrame->nChildMem) );
     assert( pProgram->nCsr==pFrame->nChildCsr );
@@ -6281,24 +6347,35 @@ case OP_DecrJumpZero: {      /* jump, in1 */
 }
 
 
-/* Opcode: AggStep0 * P2 P3 P4 P5
+/* Opcode: AggStep * P2 P3 P4 P5
 ** Synopsis: accum=r[P3] step(r[P2@P5])
 **
-** Execute the step function for an aggregate.  The
-** function has P5 arguments.   P4 is a pointer to the FuncDef
-** structure that specifies the function.  Register P3 is the
+** Execute the xStep function for an aggregate.
+** The function has P5 arguments.  P4 is a pointer to the 
+** FuncDef structure that specifies the function.  Register P3 is the
 ** accumulator.
 **
 ** The P5 arguments are taken from register P2 and its
 ** successors.
 */
-/* Opcode: AggStep * P2 P3 P4 P5
+/* Opcode: AggInverse * P2 P3 P4 P5
+** Synopsis: accum=r[P3] inverse(r[P2@P5])
+**
+** Execute the xInverse function for an aggregate.
+** The function has P5 arguments.  P4 is a pointer to the 
+** FuncDef structure that specifies the function.  Register P3 is the
+** accumulator.
+**
+** The P5 arguments are taken from register P2 and its
+** successors.
+*/
+/* Opcode: AggStep1 P1 P2 P3 P4 P5
 ** Synopsis: accum=r[P3] step(r[P2@P5])
 **
-** Execute the step function for an aggregate.  The
-** function has P5 arguments.   P4 is a pointer to an sqlite3_context
-** object that is used to run the function.  Register P3 is
-** as the accumulator.
+** Execute the xStep (if P1==0) or xInverse (if P1!=0) function for an
+** aggregate.  The function has P5 arguments.  P4 is a pointer to the 
+** FuncDef structure that specifies the function.  Register P3 is the
+** accumulator.
 **
 ** The P5 arguments are taken from register P2 and its
 ** successors.
@@ -6309,7 +6386,8 @@ case OP_DecrJumpZero: {      /* jump, in1 */
 ** sqlite3_context only happens once, instead of on each call to the
 ** step function.
 */
-case OP_AggStep0: {
+case OP_AggInverse:
+case OP_AggStep: {
   int n;
   sqlite3_context *pCtx;
 
@@ -6332,10 +6410,14 @@ case OP_AggStep0: {
   pCtx->argc = n;
   pOp->p4type = P4_FUNCCTX;
   pOp->p4.pCtx = pCtx;
-  pOp->opcode = OP_AggStep;
+
+  /* OP_AggInverse must have P1==1 and OP_AggStep must have P1==0 */
+  assert( pOp->p1==(pOp->opcode==OP_AggInverse) );
+
+  pOp->opcode = OP_AggStep1;
   /* Fall through into OP_AggStep */
 }
-case OP_AggStep: {
+case OP_AggStep1: {
   int i;
   sqlite3_context *pCtx;
   Mem *pMem;
@@ -6343,6 +6425,17 @@ case OP_AggStep: {
   assert( pOp->p4type==P4_FUNCCTX );
   pCtx = pOp->p4.pCtx;
   pMem = &aMem[pOp->p3];
+
+#ifdef SQLITE_DEBUG
+  if( pOp->p1 ){
+    /* This is an OP_AggInverse call.  Verify that xStep has always
+    ** been called at least once prior to any xInverse call. */
+    assert( pMem->uTemp==0x1122e0e3 );
+  }else{
+    /* This is an OP_AggStep call.  Mark it as such. */
+    pMem->uTemp = 0x1122e0e3;
+  }
+#endif
 
   /* If this function is inside of a trigger, the register array in aMem[]
   ** might change from one evaluation to the next.  The next block of code
@@ -6364,7 +6457,13 @@ case OP_AggStep: {
   assert( pCtx->pOut->flags==MEM_Null );
   assert( pCtx->isError==0 );
   assert( pCtx->skipFlag==0 );
+#ifndef SQLITE_OMIT_WINDOWFUNC
+  if( pOp->p1 ){
+    (pCtx->pFunc->xInverse)(pCtx,pCtx->argc,pCtx->argv);
+  }else
+#endif
   (pCtx->pFunc->xSFunc)(pCtx,pCtx->argc,pCtx->argv); /* IMP: R-24505-23230 */
+
   if( pCtx->isError ){
     if( pCtx->isError>0 ){
       sqlite3VdbeError(p, "%s", sqlite3_value_text(pCtx->pOut));
@@ -6389,22 +6488,46 @@ case OP_AggStep: {
 /* Opcode: AggFinal P1 P2 * P4 *
 ** Synopsis: accum=r[P1] N=P2
 **
-** Execute the finalizer function for an aggregate.  P1 is
-** the memory location that is the accumulator for the aggregate.
+** P1 is the memory location that is the accumulator for an aggregate
+** or window function.  Execute the finalizer function 
+** for an aggregate and store the result in P1.
 **
 ** P2 is the number of arguments that the step function takes and
 ** P4 is a pointer to the FuncDef for this function.  The P2
 ** argument is not used by this opcode.  It is only there to disambiguate
 ** functions that can take varying numbers of arguments.  The
-** P4 argument is only needed for the degenerate case where
+** P4 argument is only needed for the case where
 ** the step function was not previously called.
 */
+/* Opcode: AggValue * P2 P3 P4 *
+** Synopsis: r[P3]=value N=P2
+**
+** Invoke the xValue() function and store the result in register P3.
+**
+** P2 is the number of arguments that the step function takes and
+** P4 is a pointer to the FuncDef for this function.  The P2
+** argument is not used by this opcode.  It is only there to disambiguate
+** functions that can take varying numbers of arguments.  The
+** P4 argument is only needed for the case where
+** the step function was not previously called.
+*/
+case OP_AggValue:
 case OP_AggFinal: {
   Mem *pMem;
   assert( pOp->p1>0 && pOp->p1<=(p->nMem+1 - p->nCursor) );
+  assert( pOp->p3==0 || pOp->opcode==OP_AggValue );
   pMem = &aMem[pOp->p1];
   assert( (pMem->flags & ~(MEM_Null|MEM_Agg))==0 );
-  rc = sqlite3VdbeMemFinalize(pMem, pOp->p4.pFunc);
+#ifndef SQLITE_OMIT_WINDOWFUNC
+  if( pOp->p3 ){
+    rc = sqlite3VdbeMemAggValue(pMem, &aMem[pOp->p3], pOp->p4.pFunc);
+    pMem = &aMem[pOp->p3];
+  }else
+#endif
+  {
+    rc = sqlite3VdbeMemFinalize(pMem, pOp->p4.pFunc);
+  }
+  
   if( rc ){
     sqlite3VdbeError(p, "%s", sqlite3_value_text(pMem));
     goto abort_due_to_error;
@@ -6599,7 +6722,7 @@ case OP_IncrVacuum: {        /* jump */
 }
 #endif
 
-/* Opcode: Expire P1 * * * *
+/* Opcode: Expire P1 P2 * * *
 **
 ** Cause precompiled statements to expire.  When an expired statement
 ** is executed using sqlite3_step() it will either automatically
@@ -6608,12 +6731,19 @@ case OP_IncrVacuum: {        /* jump */
 ** 
 ** If P1 is 0, then all SQL statements become expired. If P1 is non-zero,
 ** then only the currently executing statement is expired.
+**
+** If P2 is 0, then SQL statements are expired immediately.  If P2 is 1,
+** then running SQL statements are allowed to continue to run to completion.
+** The P2==1 case occurs when a CREATE INDEX or similar schema change happens
+** that might help the statement run faster but which does not affect the
+** correctness of operation.
 */
 case OP_Expire: {
+  assert( pOp->p2==0 || pOp->p2==1 );
   if( !pOp->p1 ){
-    sqlite3ExpirePreparedStatements(db);
+    sqlite3ExpirePreparedStatements(db, pOp->p2);
   }else{
-    p->expired = 1;
+    p->expired = pOp->p2+1;
   }
   break;
 }
@@ -6937,7 +7067,10 @@ case OP_VNext: {   /* jump */
 case OP_VRename: {
   sqlite3_vtab *pVtab;
   Mem *pName;
-
+  int isLegacy;
+  
+  isLegacy = (db->flags & SQLITE_LegacyAlter);
+  db->flags |= SQLITE_LegacyAlter;
   pVtab = pOp->p4.pVtab->pVtab;
   pName = &aMem[pOp->p1];
   assert( pVtab->pModule->xRename );
@@ -6951,6 +7084,7 @@ case OP_VRename: {
   rc = sqlite3VdbeChangeEncoding(pName, SQLITE_UTF8);
   if( rc ) goto abort_due_to_error;
   rc = pVtab->pModule->xRename(pVtab, pName->z);
+  if( isLegacy==0 ) db->flags &= ~SQLITE_LegacyAlter;
   sqlite3VtabImportErrmsg(p, pVtab);
   p->expired = 0;
   if( rc ) goto abort_due_to_error;
@@ -7121,8 +7255,8 @@ case OP_MaxPgcnt: {            /* out2 */
 **
 ** See also: Function0, AggStep, AggFinal
 */
-case OP_PureFunc0:
-case OP_Function0: {
+case OP_PureFunc0:              /* group */
+case OP_Function0: {            /* group */
   int n;
   sqlite3_context *pCtx;
 
@@ -7146,8 +7280,8 @@ case OP_Function0: {
   pOp->opcode += 2;
   /* Fall through into OP_Function */
 }
-case OP_PureFunc:
-case OP_Function: {
+case OP_PureFunc:              /* group */
+case OP_Function: {            /* group */
   int i;
   sqlite3_context *pCtx;
 
@@ -7330,34 +7464,6 @@ case OP_CursorHint: {
 */
 case OP_Abortable: {
   sqlite3VdbeAssertAbortable(p);
-  break;
-}
-#endif
-
-#ifdef SQLITE_DEBUG_COLUMNCACHE
-/* Opcode:  SetTabCol   P1 P2 P3 * *
-**
-** Set a flag in register REG[P3] indicating that it holds the value
-** of column P2 from the table on cursor P1.  This flag is checked
-** by a subsequent VerifyTabCol opcode.
-**
-** This opcode only appears SQLITE_DEBUG builds.  It is used to verify
-** that the expression table column cache is working correctly.
-*/
-case OP_SetTabCol: {
-  aMem[pOp->p3].iTabColHash = TableColumnHash(pOp->p1,pOp->p2);
-  break;
-}
-/* Opcode:  VerifyTabCol   P1 P2 P3 * *
-**
-** Verify that register REG[P3] contains the value of column P2 from
-** cursor P1.  Assert() if this is not the case.
-**
-** This opcode only appears SQLITE_DEBUG builds.  It is used to verify
-** that the expression table column cache is working correctly.
-*/
-case OP_VerifyTabCol: {
-  assert( aMem[pOp->p3].iTabColHash == TableColumnHash(pOp->p1,pOp->p2) );
   break;
 }
 #endif

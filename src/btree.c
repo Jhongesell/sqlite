@@ -3325,6 +3325,12 @@ int sqlite3BtreeBeginTrans(Btree *p, int wrflag, int *pSchemaVersion){
   }
   assert( pBt->inTransaction==TRANS_WRITE || IfNotOmitAV(pBt->bDoTruncate)==0 );
 
+  if( (p->db->flags & SQLITE_ResetDatabase) 
+   && sqlite3PagerIsreadonly(pBt->pPager)==0 
+  ){
+    pBt->btsFlags &= ~BTS_READ_ONLY;
+  }
+
   /* Write transactions are not possible on a read-only database */
   if( (pBt->btsFlags & BTS_READ_ONLY)!=0 && wrflag ){
     rc = SQLITE_READONLY;
@@ -3384,6 +3390,11 @@ int sqlite3BtreeBeginTrans(Btree *p, int wrflag, int *pSchemaVersion){
         rc = sqlite3PagerBegin(pBt->pPager,wrflag>1,sqlite3TempInMemory(p->db));
         if( rc==SQLITE_OK ){
           rc = newDatabase(pBt);
+        }else if( rc==SQLITE_BUSY_SNAPSHOT && pBt->inTransaction==TRANS_NONE ){
+          /* if there was no transaction opened when this function was
+          ** called and SQLITE_BUSY_SNAPSHOT is returned, change the error
+          ** code to SQLITE_BUSY. */
+          rc = SQLITE_BUSY;
         }
       }
     }
@@ -3434,7 +3445,6 @@ int sqlite3BtreeBeginTrans(Btree *p, int wrflag, int *pSchemaVersion){
       }
     }
   }
-
 
 trans_begun:
   if( rc==SQLITE_OK ){
@@ -5193,6 +5203,23 @@ int sqlite3BtreeFirst(BtCursor *pCur, int *pRes){
   }
   return rc;
 }
+
+/*
+** This function is a no-op if cursor pCur does not point to a valid row.
+** Otherwise, if pCur is valid, configure it so that the next call to
+** sqlite3BtreeNext() is a no-op.
+*/
+#ifndef SQLITE_OMIT_WINDOWFUNC
+void sqlite3BtreeSkipNext(BtCursor *pCur){
+  /* We believe that the cursor must always be in the valid state when
+  ** this routine is called, but the proof is difficult, so we add an
+  ** ALWaYS() test just in case we are wrong. */
+  if( ALWAYS(pCur->eState==CURSOR_VALID) ){
+    pCur->eState = CURSOR_SKIPNEXT;
+    pCur->skipNext = 1;
+  }
+}
+#endif /* SQLITE_OMIT_WINDOWFUNC */
 
 /* Move the cursor to the last entry in the table.  Return SQLITE_OK
 ** on success.  Set *pRes to 0 if the cursor actually points to something
@@ -9319,8 +9346,7 @@ static void setPageReferenced(IntegrityCk *pCheck, Pgno iPg){
 ** Also check that the page number is in bounds.
 */
 static int checkRef(IntegrityCk *pCheck, Pgno iPage){
-  if( iPage==0 ) return 1;
-  if( iPage>pCheck->nPage ){
+  if( iPage>pCheck->nPage || iPage==0 ){
     checkAppendMsg(pCheck, "invalid page number %d", iPage);
     return 1;
   }
@@ -9375,17 +9401,12 @@ static void checkList(
 ){
   int i;
   int expected = N;
-  int iFirst = iPage;
-  while( N-- > 0 && pCheck->mxErr ){
+  int nErrAtStart = pCheck->nErr;
+  while( iPage!=0 && pCheck->mxErr ){
     DbPage *pOvflPage;
     unsigned char *pOvflData;
-    if( iPage<1 ){
-      checkAppendMsg(pCheck,
-         "%d of %d pages missing from overflow list starting at %d",
-          N+1, expected, iFirst);
-      break;
-    }
     if( checkRef(pCheck, iPage) ) break;
+    N--;
     if( sqlite3PagerGet(pCheck->pPager, (Pgno)iPage, &pOvflPage, 0) ){
       checkAppendMsg(pCheck, "failed to get page %d", iPage);
       break;
@@ -9429,10 +9450,12 @@ static void checkList(
 #endif
     iPage = get4byte(pOvflData);
     sqlite3PagerUnref(pOvflPage);
-
-    if( isFreeList && N<(iPage!=0) ){
-      checkAppendMsg(pCheck, "free-page count in header is too small");
-    }
+  }
+  if( N && nErrAtStart==pCheck->nErr ){
+    checkAppendMsg(pCheck,
+      "%s is %d but should be %d",
+      isFreeList ? "size" : "overflow list length",
+      expected-N, expected);
   }
 }
 #endif /* SQLITE_OMIT_INTEGRITY_CHECK */
@@ -9826,6 +9849,24 @@ char *sqlite3BtreeIntegrityCheck(
 
   /* Check all the tables.
   */
+#ifndef SQLITE_OMIT_AUTOVACUUM
+  if( pBt->autoVacuum ){
+    int mx = 0;
+    int mxInHdr;
+    for(i=0; (int)i<nRoot; i++) if( mx<aRoot[i] ) mx = aRoot[i];
+    mxInHdr = get4byte(&pBt->pPage1->aData[52]);
+    if( mx!=mxInHdr ){
+      checkAppendMsg(&sCheck,
+        "max rootpage (%d) disagrees with header (%d)",
+        mx, mxInHdr
+      );
+    }
+  }else if( get4byte(&pBt->pPage1->aData[64])!=0 ){
+    checkAppendMsg(&sCheck,
+      "incremental_vacuum enabled with a max rootpage of zero"
+    );
+  }
+#endif
   testcase( pBt->db->flags & SQLITE_CellSizeCk );
   pBt->db->flags &= ~SQLITE_CellSizeCk;
   for(i=0; (int)i<nRoot && sCheck.mxErr; i++){
