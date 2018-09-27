@@ -479,6 +479,7 @@ struct Wal {
 #ifdef SQLITE_ENABLE_SNAPSHOT
   WalIndexHdr *pSnapshot;    /* Start transaction here if not NULL */
 #endif
+  LockEventHandlers* pLockEventHandlers; /* For external lock synchronization */
 };
 
 /*
@@ -863,6 +864,9 @@ static void walUnlockShared(Wal *pWal, int lockIdx){
 static int walLockExclusive(Wal *pWal, int lockIdx, int n){
   int rc;
   if( pWal->exclusiveMode ) return SQLITE_OK;
+
+  sqlite3InvokeUnlockEvent(pPager->pLockEventHandlers, eLock);
+
   rc = sqlite3OsShmLock(pWal->pDbFd, lockIdx, n,
                         SQLITE_SHM_LOCK | SQLITE_SHM_EXCLUSIVE);
   WALTRACE(("WAL%p: acquire EXCLUSIVE-%s cnt=%d %s\n", pWal,

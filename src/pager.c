@@ -1192,12 +1192,14 @@ static int pagerLockDb(Pager *pPager, int eLock){
       if (pPager->noLock) {
           rc = SQLITE_OK;
       } else {
-        /* Get application lock, if applicable */
-        rc = sqlite3InvokeLockEvent(pPager->pLockEventHandlers, eLock);
+          /* Get application lock, if applicable */
+          rc = sqlite3InvokeLockEvent(pPager->pLockEventHandlers, eLock);
 
-        if (rc == SQLITE_BUSY) { return rc; }
+          if (rc == SQLITE_BUSY) { return rc; }
           
-        rc = sqlite3OsLock(pPager->fd, eLock);          
+          rc = sqlite3OsLock(pPager->fd, eLock);
+
+          if (rc == SQLITE_BUSY) { return rc; }
       }
       
     if( rc==SQLITE_OK && (pPager->eLock!=UNKNOWN_LOCK||eLock==EXCLUSIVE_LOCK) ){
@@ -7539,7 +7541,10 @@ static int pagerOpenWal(Pager *pPager){
     rc = sqlite3WalOpen(pPager->pVfs,
         pPager->fd, pPager->zWal, pPager->exclusiveMode,
         pPager->journalSizeLimit, &pPager->pWal
-    );
+        );
+
+    // Assign lock event handlers
+    pPager->pWal->pLockEventHandlers = pPager->pLockEventHandlers
   }
   pagerFixMaplimit(pPager);
 
