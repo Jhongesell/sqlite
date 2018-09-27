@@ -1192,7 +1192,7 @@ static int pagerLockDb(Pager *pPager, int eLock){
       if (pPager->noLock) {
           rc = SQLITE_OK;
       } else {
-        /* Get application lock, if applicable */
+        /* Invoke application lock, if applicable */
         rc = sqlite3InvokeLockEvent(pPager->pLockEventHandlers, eLock);
 
         if (rc == SQLITE_BUSY) { return rc; }
@@ -2146,6 +2146,10 @@ static int pager_end_transaction(Pager *pPager, int hasMaster, int bCommit){
     ** locking_mode=exclusive mode but is no longer, drop the EXCLUSIVE 
     ** lock held on the database file.
     */
+
+    /* Invoke application unlock, if applicable */
+    sqlite3InvokeUnlockEvent(pPager->pLockEventHandlers, NO_LOCK);
+      
     rc2 = sqlite3WalEndWriteTransaction(pPager->pWal);
     assert( rc2==SQLITE_OK );
   }else if( rc==SQLITE_OK && bCommit && pPager->dbFileSize>pPager->dbSize ){
@@ -5865,7 +5869,13 @@ int sqlite3PagerBegin(Pager *pPager, int exFlag, int subjInMemory){
       ** The busy-handler is not invoked if another connection already
       ** holds the write-lock. If possible, the upper layer will call it.
       */
-      rc = sqlite3WalBeginWriteTransaction(pPager->pWal);
+
+      /* Invoke application lock, if applicable */
+      rc = sqlite3InvokeLockEvent(pPager->pLockEventHandlers, EXCLUSIVE_LOCK);
+
+      if( rc==SQLITE_OK ){      
+        rc = sqlite3WalBeginWriteTransaction(pPager->pWal);
+      }
     }else{
       /* Obtain a RESERVED lock on the database file. If the exFlag parameter
       ** is true, then immediately upgrade this to an EXCLUSIVE lock. The
