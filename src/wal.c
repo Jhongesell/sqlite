@@ -865,10 +865,12 @@ static int walLockExclusive(Wal *pWal, int lockIdx, int n){
   int rc;
   if( pWal->exclusiveMode ) return SQLITE_OK;
 
-  sqlite3InvokeUnlockEvent(pPager->pLockEventHandlers, eLock);
+  rc = sqlite3InvokeLockEvent(pWal->pLockEventHandlers, EXCLUSIVE_LOCK);
 
-  rc = sqlite3OsShmLock(pWal->pDbFd, lockIdx, n,
-                        SQLITE_SHM_LOCK | SQLITE_SHM_EXCLUSIVE);
+  if (rc==SQLITE_OK) {
+    rc = sqlite3OsShmLock(pWal->pDbFd, lockIdx, n,
+                          SQLITE_SHM_LOCK | SQLITE_SHM_EXCLUSIVE);
+  }
   WALTRACE(("WAL%p: acquire EXCLUSIVE-%s cnt=%d %s\n", pWal,
             walLockName(lockIdx), n, rc ? "failed" : "ok"));
   VVA_ONLY( pWal->lockError = (u8)(rc!=SQLITE_OK && rc!=SQLITE_BUSY); )
@@ -876,6 +878,7 @@ static int walLockExclusive(Wal *pWal, int lockIdx, int n){
 }
 static void walUnlockExclusive(Wal *pWal, int lockIdx, int n){
   if( pWal->exclusiveMode ) return;
+  sqlite3InvokeUnlockEvent(pWal->pLockEventHandlers, NO_LOCK);
   (void)sqlite3OsShmLock(pWal->pDbFd, lockIdx, n,
                          SQLITE_SHM_UNLOCK | SQLITE_SHM_EXCLUSIVE);
   WALTRACE(("WAL%p: release EXCLUSIVE-%s cnt=%d\n", pWal,
@@ -1342,12 +1345,13 @@ int sqlite3WalOpen(
   const char *zWalName,           /* Name of the WAL file */
   int bNoShm,                     /* True to run in heap-memory mode */
   i64 mxWalSize,                  /* Truncate WAL to this size on reset */
+  LockEventHandlers *pLh,         /* Lock even handlers */
   Wal **ppWal                     /* OUT: Allocated Wal handle */
 ){
   int rc;                         /* Return Code */
   Wal *pRet;                      /* Object to allocate and return */
   int flags;                      /* Flags passed to OsOpen() */
-
+  
   assert( zWalName && zWalName[0] );
   assert( pDbFd );
 
@@ -1383,7 +1387,8 @@ int sqlite3WalOpen(
   pRet->syncHeader = 1;
   pRet->padToSectorBoundary = 1;
   pRet->exclusiveMode = (bNoShm ? WAL_HEAPMEMORY_MODE: WAL_NORMAL_MODE);
-
+  pRet->pLockEventHandlers = pLh;
+  
   /* Open file handle on the write-ahead log file. */
   flags = (SQLITE_OPEN_READWRITE|SQLITE_OPEN_CREATE|SQLITE_OPEN_WAL);
   rc = sqlite3OsOpen(pVfs, zWalName, pRet->pWalFd, flags, &flags);

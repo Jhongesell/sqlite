@@ -1599,6 +1599,15 @@ int sqlite3InvokeLockEvent(LockEventHandlers *p, int lock_type){
   return SQLITE_OK;
 }
 
+int sqlite3InvokeBusyEvent(LockEventHandlers *p, int lock_type){
+
+  if(p->busy != NULL) {
+    return p->busy(p->pArg, lock_type);
+  }
+
+  return SQLITE_OK;
+}
+
 int sqlite3InvokeUnlockEvent(LockEventHandlers *p, int lock_type){
 
   if(p->unlock != NULL) {
@@ -2076,10 +2085,12 @@ void *sqlite3_profile(
 #endif /* SQLITE_OMIT_TRACE */
 
 int sqlite3_lock_event_handlers( sqlite3* db, 
-                                 int (*xLock)(void*,int), 
+                                 int (*xLock)(void*,int),
+                                 int (*xBusy)(void*,int), 
                                  int (*xUnlock)(void*,int), 
                                  void *pArg){
   db->lockEventHandlers.lock   = xLock; 
+  db->lockEventHandlers.busy   = xBusy; 
   db->lockEventHandlers.unlock = xUnlock; 
   db->lockEventHandlers.pArg   = pArg; 
 }
