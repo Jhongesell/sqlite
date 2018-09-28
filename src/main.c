@@ -1599,10 +1599,10 @@ int sqlite3InvokeLockEvent(LockEventHandlers *p, int lock_type){
   return SQLITE_OK;
 }
 
-int sqlite3InvokeBusyEvent(LockEventHandlers *p, int lock_type){
+int sqlite3InvokeBusyEvent(LockEventHandlers *p, int lock_type, int calls){
 
   if(p->busy != NULL) {
-    return p->busy(p->pArg, lock_type);
+    return p->busy(p->pArg, lock_type, calls);
   }
 
   return SQLITE_OK;

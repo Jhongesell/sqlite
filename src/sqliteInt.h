@@ -977,10 +977,10 @@ struct BusyHandler {
 
 typedef struct LockEventHandlers LockEventHandlers;
 struct LockEventHandlers {
-  int (*lock)(void *,int);   /* The lock callback */
-  int (*busy)(void *,int);   /* The busy callback */
-  int (*unlock)(void *,int); /* The unlock callback */
-  void *pArg;                /* First arg to the callback */
+  int (*lock)(void *,int);       /* Lock callback */
+  int (*busy)(void *,int, int);  /* Busy callback. Arg1 is lock type, Arg2 is number of calls. */
+  int (*unlock)(void *,int);     /* Unlock callback */
+  void *pArg;                    /* First arg to the callback */
 };
 
 /*
@@ -4260,7 +4260,7 @@ char sqlite3AffinityType(const char*, Column*);
 void sqlite3Analyze(Parse*, Token*, Token*);
 int sqlite3InvokeBusyHandler(BusyHandler*, sqlite3_file*);
 int sqlite3InvokeLockEvent(LockEventHandlers *p, int lock_type);
-int sqlite3InvokeBusyEvent(LockEventHandlers *p, int lock_type);
+int sqlite3InvokeBusyEvent(LockEventHandlers *p, int lock_type, int calls);
 int sqlite3InvokeUnlockEvent(LockEventHandlers *p, int lock_type);
 int sqlite3FindDb(sqlite3*, Token*);
 int sqlite3FindDbName(sqlite3 *, const char *);

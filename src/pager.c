@@ -3951,7 +3951,8 @@ void sqlite3PagerPagecount(Pager *pPager, int *pnPage){
 ** variable to locktype before returning.
 */
 static int pager_wait_on_lock(Pager *pPager, int locktype){
-  int rc;                              /* Return code */
+  int busy_calls = 1;
+  int rc; /* Return code */
 
   /* Check that this is either a no-op (because the requested lock is 
   ** already held), or one of the transitions that the busy-handler
@@ -3971,7 +3972,7 @@ static int pager_wait_on_lock(Pager *pPager, int locktype){
          other but not both. */
       if (pPager->pLockEventHandlers->busy != NULL)
       {
-        rc = sqlite3InvokeBusyEvent(pPager->pLockEventHandlers, locktype);
+        rc = sqlite3InvokeBusyEvent(pPager->pLockEventHandlers, locktype, busy_calls++);
         if (rc==SQLITE_BUSY) {
           break;
         }
