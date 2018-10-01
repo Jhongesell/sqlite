@@ -1205,7 +1205,7 @@ static int pagerLockDb(Pager *pPager, int eLock){
       pPager->eLock = (u8)eLock;
       IOTRACE(("LOCK %p %d\n", pPager, eLock))
     } else {
-      sqlite3InvokeUnlockEvent(pPager->pLockEventHandlers, pPager->eLock);
+      sqlite3InvokeUnlockEvent(pPager->pLockEventHandlers, eLock);
     }
   }
   return rc;

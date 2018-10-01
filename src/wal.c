@@ -865,12 +865,16 @@ static int walLockExclusive(Wal *pWal, int lockIdx, int n){
   int rc;
   if( pWal->exclusiveMode ) return SQLITE_OK;
 
-  rc = sqlite3InvokeLockEvent(pWal->pLockEventHandlers, EXCLUSIVE_LOCK);
-
-  if (rc==SQLITE_OK) {
-    rc = sqlite3OsShmLock(pWal->pDbFd, lockIdx, n,
-                          SQLITE_SHM_LOCK | SQLITE_SHM_EXCLUSIVE);
+  if (lockIdx == WAL_WRITE_LOCK) {
+    rc = sqlite3InvokeLockEvent(pWal->pLockEventHandlers, EXCLUSIVE_LOCK);
+    if (rc!=SQLITE_OK) {
+        return rc;
+    }
   }
+
+  rc = sqlite3OsShmLock(pWal->pDbFd, lockIdx, n,
+                          SQLITE_SHM_LOCK | SQLITE_SHM_EXCLUSIVE);
+
   WALTRACE(("WAL%p: acquire EXCLUSIVE-%s cnt=%d %s\n", pWal,
             walLockName(lockIdx), n, rc ? "failed" : "ok"));
   VVA_ONLY( pWal->lockError = (u8)(rc!=SQLITE_OK && rc!=SQLITE_BUSY); )
@@ -878,7 +882,9 @@ static int walLockExclusive(Wal *pWal, int lockIdx, int n){
 }
 static void walUnlockExclusive(Wal *pWal, int lockIdx, int n){
   if( pWal->exclusiveMode ) return;
-  sqlite3InvokeUnlockEvent(pWal->pLockEventHandlers, NO_LOCK);
+  if (lockIdx == WAL_WRITE_LOCK) {
+    sqlite3InvokeUnlockEvent(pWal->pLockEventHandlers, NO_LOCK);
+  }
   (void)sqlite3OsShmLock(pWal->pDbFd, lockIdx, n,
                          SQLITE_SHM_UNLOCK | SQLITE_SHM_EXCLUSIVE);
   WALTRACE(("WAL%p: release EXCLUSIVE-%s cnt=%d\n", pWal,
