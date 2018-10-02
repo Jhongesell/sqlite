@@ -1590,6 +1590,33 @@ int sqlite3InvokeBusyHandler(BusyHandler *p, sqlite3_file *pFile){
   return rc; 
 }
 
+int sqlite3InvokeLockEvent(LockEventHandlers *p, int lock_type){
+
+  if(p->lock != NULL) {
+    return p->lock(p->pArg, lock_type);
+  }
+
+  return SQLITE_OK;
+}
+
+int sqlite3InvokeBusyEvent(LockEventHandlers *p, int lock_type, int calls){
+
+  if(p->busy != NULL) {
+    return p->busy(p->pArg, lock_type, calls);
+  }
+
+  return SQLITE_OK;
+}
+
+int sqlite3InvokeUnlockEvent(LockEventHandlers *p, int lock_type){
+
+  if(p->unlock != NULL) {
+    return p->unlock(p->pArg, lock_type);
+  }
+
+  return SQLITE_OK;
+}
+
 /*
 ** This routine sets the busy callback for an Sqlite database to the
 ** given callback function with the given argument.
@@ -2056,6 +2083,17 @@ void *sqlite3_profile(
 }
 #endif /* SQLITE_OMIT_DEPRECATED */
 #endif /* SQLITE_OMIT_TRACE */
+
+int sqlite3_lock_event_handlers( sqlite3* db, 
+                                 int (*xLock)(void*,int),
+                                 int (*xBusy)(void*,int), 
+                                 int (*xUnlock)(void*,int), 
+                                 void *pArg){
+  db->lockEventHandlers.lock   = xLock; 
+  db->lockEventHandlers.busy   = xBusy; 
+  db->lockEventHandlers.unlock = xUnlock; 
+  db->lockEventHandlers.pArg   = pArg; 
+}
 
 /*
 ** Register a function to be invoked when a transaction commits.
@@ -3130,6 +3168,9 @@ static int openDatabase(
     sqlite3Error(db, rc);
     goto opendb_out;
   }
+
+  sqlite3BtreeThreadLockHandlers(db->aDb[0].pBt, (void*)&db->lockEventHandlers);
+    
   sqlite3BtreeEnter(db->aDb[0].pBt);
   db->aDb[0].pSchema = sqlite3SchemaGet(db, db->aDb[0].pBt);
   if( !db->mallocFailed ) ENC(db) = SCHEMA_ENC(db);

@@ -700,6 +700,7 @@ struct Pager {
   int (*xBusyHandler)(void*); /* Function to call when busy */
   void *pBusyHandlerArg;      /* Context argument for xBusyHandler */
   int aStat[4];               /* Total cache hits, misses, writes, spills */
+  LockEventHandlers* pLockEventHandlers; /* For external lock synchronization */
 #ifdef SQLITE_TEST
   int nRead;                  /* Database pages read */
 #endif
@@ -1152,7 +1153,14 @@ static int pagerUnlockDb(Pager *pPager, int eLock){
   assert( eLock!=NO_LOCK || pagerUseWal(pPager)==0 );
   if( isOpen(pPager->fd) ){
     assert( pPager->eLock>=eLock );
-    rc = pPager->noLock ? SQLITE_OK : sqlite3OsUnlock(pPager->fd, eLock);
+
+    if (pPager->noLock) {
+      rc = SQLITE_OK;
+    } else {
+      rc = sqlite3OsUnlock(pPager->fd, eLock);
+      sqlite3InvokeUnlockEvent(pPager->pLockEventHandlers, eLock);
+    }
+    
     if( pPager->eLock!=UNKNOWN_LOCK ){
       pPager->eLock = (u8)eLock;
     }
@@ -1176,10 +1184,24 @@ static int pagerLockDb(Pager *pPager, int eLock){
 
   assert( eLock==SHARED_LOCK || eLock==RESERVED_LOCK || eLock==EXCLUSIVE_LOCK );
   if( pPager->eLock<eLock || pPager->eLock==UNKNOWN_LOCK ){
-    rc = pPager->noLock ? SQLITE_OK : sqlite3OsLock(pPager->fd, eLock);
+
+      if (pPager->noLock) {
+          rc = SQLITE_OK;
+      } else {
+        rc = sqlite3InvokeLockEvent(pPager->pLockEventHandlers, eLock);
+
+        if (rc == SQLITE_BUSY) { return rc; }
+          
+        rc = sqlite3OsLock(pPager->fd, eLock);
+
+        if (rc == SQLITE_BUSY) { return rc; }
+      }
+      
     if( rc==SQLITE_OK && (pPager->eLock!=UNKNOWN_LOCK||eLock==EXCLUSIVE_LOCK) ){
       pPager->eLock = (u8)eLock;
       IOTRACE(("LOCK %p %d\n", pPager, eLock))
+    } else {
+      sqlite3InvokeUnlockEvent(pPager->pLockEventHandlers, eLock);
     }
   }
   return rc;
@@ -2120,6 +2142,7 @@ static int pager_end_transaction(Pager *pPager, int hasMaster, int bCommit){
     ** locking_mode=exclusive mode but is no longer, drop the EXCLUSIVE 
     ** lock held on the database file.
     */
+      
     rc2 = sqlite3WalEndWriteTransaction(pPager->pWal);
     assert( rc2==SQLITE_OK );
   }else if( rc==SQLITE_OK && bCommit && pPager->dbFileSize>pPager->dbSize ){
@@ -3515,6 +3538,10 @@ void sqlite3PagerSetCachesize(Pager *pPager, int mxPage){
   sqlite3PcacheSetCachesize(pPager->pPCache, mxPage);
 }
 
+void sqlite3PagerSetLockEventHandlers(Pager* pPager, LockEventHandlers *pHandlers){
+  pPager->pLockEventHandlers = pHandlers;
+}
+
 /*
 ** Change the maximum number of in-memory pages that are allowed
 ** before attempting to spill pages to journal.
@@ -3920,7 +3947,8 @@ void sqlite3PagerPagecount(Pager *pPager, int *pnPage){
 ** variable to locktype before returning.
 */
 static int pager_wait_on_lock(Pager *pPager, int locktype){
-  int rc;                              /* Return code */
+  int busy_calls = 1;
+  int rc; /* Return code */
 
   /* Check that this is either a no-op (because the requested lock is 
   ** already held), or one of the transitions that the busy-handler
@@ -3934,7 +3962,24 @@ static int pager_wait_on_lock(Pager *pPager, int locktype){
 
   do {
     rc = pagerLockDb(pPager, locktype);
-  }while( rc==SQLITE_BUSY && pPager->xBusyHandler(pPager->pBusyHandlerArg) );
+
+    if (rc==SQLITE_BUSY) {
+      /* Call either LockEvent busy if registered of busy handler. One or the
+         other but not both. */
+      if (pPager->pLockEventHandlers->busy != NULL)
+      {
+        rc = sqlite3InvokeBusyEvent(pPager->pLockEventHandlers, locktype, busy_calls++);
+        if (rc==SQLITE_BUSY) {
+          break;
+        }
+      } else {
+        if(pPager->xBusyHandler(pPager->pBusyHandlerArg) == 0)
+        {
+            break;
+        }
+      }
+    }
+  } while (rc==SQLITE_BUSY);
   return rc;
 }
 
@@ -5835,7 +5880,9 @@ int sqlite3PagerBegin(Pager *pPager, int exFlag, int subjInMemory){
       ** The busy-handler is not invoked if another connection already
       ** holds the write-lock. If possible, the upper layer will call it.
       */
+
       rc = sqlite3WalBeginWriteTransaction(pPager->pWal);
+
     }else{
       /* Obtain a RESERVED lock on the database file. If the exFlag parameter
       ** is true, then immediately upgrade this to an EXCLUSIVE lock. The
@@ -7506,10 +7553,15 @@ static int pagerOpenWal(Pager *pPager){
   ** (e.g. due to malloc() failure), return an error code.
   */
   if( rc==SQLITE_OK ){
-    rc = sqlite3WalOpen(pPager->pVfs,
-        pPager->fd, pPager->zWal, pPager->exclusiveMode,
-        pPager->journalSizeLimit, &pPager->pWal
-    );
+    rc = sqlite3WalOpen(
+           pPager->pVfs,
+           pPager->fd,
+           pPager->zWal,
+           pPager->exclusiveMode,
+           pPager->journalSizeLimit,
+           pPager->pLockEventHandlers,
+           &pPager->pWal
+        );
   }
   pagerFixMaplimit(pPager);
 

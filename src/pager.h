@@ -127,6 +127,7 @@ int sqlite3PagerReadFileheader(Pager*, int, unsigned char*);
 
 /* Functions used to configure a Pager object. */
 void sqlite3PagerSetBusyHandler(Pager*, int(*)(void *), void *);
+void sqlite3PagerSetLockEventHandlers(Pager*, LockEventHandlers *pLockHandler);
 int sqlite3PagerSetPagesize(Pager*, u32*, int);
 #ifdef SQLITE_HAS_CODEC
 void sqlite3PagerAlignReserve(Pager*,Pager*);

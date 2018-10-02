@@ -975,6 +975,14 @@ struct BusyHandler {
   u8 bExtraFileArg;                 /* Include sqlite3_file as callback arg */
 };
 
+typedef struct LockEventHandlers LockEventHandlers;
+struct LockEventHandlers {
+  int (*lock)(void *,int);       /* Lock callback */
+  int (*busy)(void *,int, int);  /* Busy callback. Arg1 is lock type, Arg2 is number of calls. */
+  int (*unlock)(void *,int);     /* Unlock callback */
+  void *pArg;                    /* First arg to the callback */
+};
+
 /*
 ** Name of the master database table.  The master database table
 ** is a special table that holds the names and attributes of all
@@ -1466,6 +1474,7 @@ struct sqlite3 {
   Db aDbStatic[2];              /* Static space for the 2 default backends */
   Savepoint *pSavepoint;        /* List of active savepoints */
   int busyTimeout;              /* Busy handler timeout, in msec */
+  LockEventHandlers lockEventHandlers; /* External lock/sync callbacks */
   int nSavepoint;               /* Number of non-transaction savepoints */
   int nStatement;               /* Number of nested statement-transactions  */
   i64 nDeferredCons;            /* Net deferred constraints this transaction. */
@@ -4251,6 +4260,9 @@ CollSeq *sqlite3GetCollSeq(Parse*, u8, CollSeq *, const char*);
 char sqlite3AffinityType(const char*, Column*);
 void sqlite3Analyze(Parse*, Token*, Token*);
 int sqlite3InvokeBusyHandler(BusyHandler*, sqlite3_file*);
+int sqlite3InvokeLockEvent(LockEventHandlers *p, int lock_type);
+int sqlite3InvokeBusyEvent(LockEventHandlers *p, int lock_type, int calls);
+int sqlite3InvokeUnlockEvent(LockEventHandlers *p, int lock_type);
 int sqlite3FindDb(sqlite3*, Token*);
 int sqlite3FindDbName(sqlite3 *, const char *);
 int sqlite3AnalysisLoad(sqlite3*,int iDB);
